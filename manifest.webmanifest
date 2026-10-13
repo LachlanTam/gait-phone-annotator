@@ -1,0 +1,14 @@
+{
+  "name": "Gait marks",
+  "short_name": "Gait marks",
+  "description": "Mark steps and turns on a portion of a bout, offline. The frames stay on the phone.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#12141a",
+  "theme_color": "#12141a",
+  "icons": [
+    { "src": "icon-180.png", "sizes": "180x180", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

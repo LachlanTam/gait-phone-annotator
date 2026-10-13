@@ -1,0 +1,1030 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#12141a">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<title>Gait marks</title>
+<!--
+  Phone annotator for short portions of a bout: steps and turns only.
+  Asked for 12 Oct 2026, to annotate on the iPhone while the laptop's lid is closed.
+
+  WHAT THIS IS
+  The page's code only, hosted on GitHub Pages and cached by sw.js so it works
+  offline from the Home Screen. It holds no frames, no names and no participant
+  IDs, and makes no network request apart from loading itself. The frames come
+  from a pack (tools/phone_pack.py) chosen from the phone's Files, and never
+  leave the phone. The source is video-annotation/tools/phone.html in the vault;
+  publish_phone.sh copies it into the Pages repository.
+
+  WHAT IT DOES, AND WHAT STAYS ON THE MAC
+  Marks IC, TO, UNSCORABLE, TURN_START and TURN_END on a pack's frames, and
+  exports them as {pack_id}-PhoneMarks.csv for tools/phone_merge.py. No play, no
+  stamp panel, no sync flash, no landmarks, no helper: those stay in annotate.html.
+
+  THE FRAME INDEX SHOWN IS THE PROBE TABLE'S
+  Each image in the pack is named by its probe frame_index, and pack.json carries
+  the probe rows for the range. The index and time on screen are read from those
+  rows. Nothing here computes a time from index / fps.
+
+  THE MARKING RULES ARE annotate.html's, COPIED, NOT REWRITTEN
+  The functions between `copied from annotate.html` lines are byte-for-byte
+  copies, and selftest.py fails if either file changes without the other. So the
+  spacebar cycle (`Next`), an UNSCORABLE taking its event's place (D35), one
+  gait event per frame, turn spans and undo behave exactly as on the Mac. The
+  keys they name are this page's buttons (see CFG below).
+
+  THE CONTEXT MARKS
+  A pack carries the rater's last cycle event and last turn mark from before the
+  range. They sit in S.marks so `Next` continues the cycle from the first press
+  and `Turn` knows whether the portion opens inside a turn, but they are before
+  the first frame, so nothing here can reach them, and they are never exported.
+
+  SAVED ON EVERY CHANGE
+  iOS kills a background tab without warning, so every change is written to
+  IndexedDB under the pack_id, with the undo history. Opening the same pack again
+  resumes it. A saved pack can be exported or forgotten without its zip.
+-->
+<style>
+  :root {
+    --bg: #12141a; --panel: #1b1f28; --line: #2c323f;
+    --ink: #e8eaf0; --dim: #9aa3b2;
+    --ic: #4fc3f7; --to: #ffb74d; --bad: #ef5350; --ok: #66bb6a; --turn: #4db6ac;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+         overscroll-behavior: none; }
+  button { font: inherit; color: var(--ink); background: #262c38; border: 1px solid var(--line);
+           border-radius: 10px; padding: 0 6px; min-height: 48px; touch-action: manipulation;
+           font-weight: 600; }
+  button:active { background: #33405a; }
+  button.ic { color: var(--ic); } button.to { color: var(--to); }
+  button.bad { color: var(--bad); } button.turn { color: var(--turn); }
+  button.primary { background: #2d5bd7; border-color: #2d5bd7; color: #fff; }
+  button.off { opacity: .45; }
+  .dim { color: var(--dim); }
+  .err { color: var(--bad); white-space: pre-wrap; }
+
+  /* The open screen */
+  #open { max-width: 560px; margin: 0 auto;
+          padding: calc(16px + env(safe-area-inset-top)) 16px 24px; }
+  #open h1 { font-size: 22px; margin: 0 0 4px; }
+  #open p { margin: 0 0 14px; }
+  #pick { display: block; text-align: center; line-height: 52px; border-radius: 12px;
+          background: #2d5bd7; color: #fff; font-weight: 700; margin: 0 0 16px; }
+  #pick input { display: none; }
+  .saved { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin: 0 0 8px;
+           background: var(--panel); }
+  .saved .who { font-weight: 700; word-break: break-all; }
+  .saved .row { display: flex; gap: 8px; margin-top: 8px; }
+  .saved .row button { flex: 1; min-height: 40px; font-weight: 500; font-size: 14px; }
+
+  /* The annotating screen: picture on top in portrait, beside the controls in landscape */
+  #app { display: none; height: 100dvh; grid-template-rows: auto minmax(0, 1fr) auto auto;
+         padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left); }
+  #app.on { display: grid; }
+  #bar { display: flex; align-items: baseline; gap: 10px; padding: 6px 12px; background: var(--panel);
+         border-bottom: 1px solid var(--line); }
+  #fi { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  #ts { font-variant-numeric: tabular-nums; color: var(--dim); }
+  #counts { margin-left: auto; font-size: 12px; color: var(--dim); text-align: right; }
+  #menuBtn { min-height: 34px; padding: 0 10px; font-weight: 500; }
+  #stage { position: relative; overflow: hidden; background: #000; touch-action: none;
+           display: flex; align-items: center; justify-content: center; }
+  #frame { max-width: 100%; max-height: 100%; transform-origin: center center;
+           will-change: transform; pointer-events: none; }
+  #frame.pending { visibility: hidden; }
+  /* While a finger is scrubbing the strip, the last frame that loaded stays up,
+     dimmed, so a fast scrub does not flash black. It is never shown at full
+     strength under another frame's number. See scrub(). */
+  #frame.stale { opacity: .45; }
+  /* Toe-off is judged on a few pixels of daylight under a shoe: past this zoom the
+     image is shown as its own pixels, as in annotate.html. */
+  #frame.pixels { image-rendering: pixelated; }
+  #here { position: absolute; left: 8px; top: 6px; font-size: 13px; padding: 2px 8px;
+          border-radius: 6px; background: rgba(0,0,0,.6); pointer-events: none; }
+  #zoomTag { position: absolute; right: 8px; top: 6px; font-size: 12px; color: var(--dim);
+             background: rgba(0,0,0,.6); padding: 2px 6px; border-radius: 6px; pointer-events: none; }
+  #strip { display: block; width: 100%; height: 52px; background: #0b0d12; touch-action: none;
+           cursor: ew-resize; }
+  #controls { padding: 8px 8px calc(8px + env(safe-area-inset-bottom)); display: grid; gap: 6px;
+              background: var(--bg); }
+  .r { display: grid; gap: 6px; }
+  .r4 { grid-template-columns: repeat(4, 1fr); }
+  .r2 { grid-template-columns: 2fr 1fr; }
+  #next { font-size: 18px; min-height: 56px; }
+  #list { max-height: 22vh; overflow: auto; border-top: 1px solid var(--line); font-size: 13px;
+          font-variant-numeric: tabular-nums; -webkit-overflow-scrolling: touch; }
+  #list div { display: grid; grid-template-columns: 5ch 1fr auto; gap: 8px; padding: 7px 12px;
+              border-bottom: 1px solid #1d222c; }
+  #list div.on { background: #1a2633; }
+  #list .tIC { color: var(--ic); } #list .tTO { color: var(--to); }
+  #list .tUNSCORABLE { color: var(--bad); } #list .tTURN_START, #list .tTURN_END { color: var(--turn); }
+  #toast { position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom));
+           transform: translateX(-50%); max-width: 92vw; background: #000d; color: #fff; padding: 8px 14px;
+           border-radius: 10px; font-size: 14px; opacity: 0; transition: opacity .2s; pointer-events: none;
+           text-align: center; z-index: 10; }
+  #toast.on { opacity: 1; }
+  #menu { position: fixed; inset: 0; background: #000a; display: none; z-index: 5; }
+  #menu.on { display: flex; align-items: flex-end; justify-content: center; }
+  #menu .sheet { width: 100%; max-width: 560px; background: var(--panel); border-radius: 14px 14px 0 0;
+                 padding: 14px 14px calc(14px + env(safe-area-inset-bottom)); display: grid; gap: 8px; }
+
+  @media (orientation: landscape) and (max-height: 600px) {
+    #app.on { grid-template-columns: minmax(0, 1fr) 300px; grid-template-rows: auto minmax(0, 1fr) auto; }
+    #bar { grid-column: 1 / -1; }
+    #stage { grid-column: 1; grid-row: 2; }
+    #strip { grid-column: 1; grid-row: 3; }
+    #side { grid-column: 2; grid-row: 2 / 4; overflow: auto; display: flex; flex-direction: column; }
+    #controls { padding-bottom: 8px; }
+    #list { max-height: none; flex: 1; }
+    button { min-height: 42px; }
+    #next { min-height: 48px; }
+  }
+</style>
+</head>
+<body>
+
+<div id="open">
+  <h1>Gait marks</h1>
+  <p class="dim">Steps and turns on a portion of a bout. Open a <b>…-PhonePack.zip</b> from Files
+    (AirDropped from the Mac). The frames stay on this phone.</p>
+  <label id="pick">Open a pack<input id="file" type="file" accept=".zip,application/zip"></label>
+  <div id="openErr" class="err"></div>
+  <div id="savedList"></div>
+  <p class="dim" style="font-size:13px;margin-top:18px">Marks are saved on this phone as you go.
+    When a portion is done: ⋯ → Export, AirDrop the CSV to the Mac, then <i>Import phone marks</i>
+    in the annotator. Delete the zip afterwards: the frames identify the walker.</p>
+</div>
+
+<div id="app">
+  <div id="bar">
+    <span id="fi" title="Frame index (probe table). Tap to go to a frame.">—</span>
+    <span id="ts"></span>
+    <span id="counts"></span>
+    <button id="menuBtn" type="button">⋯</button>
+  </div>
+  <div id="stage">
+    <img id="frame" alt="">
+    <div id="here"></div>
+    <div id="zoomTag"></div>
+  </div>
+  <canvas id="strip"></canvas>
+  <div id="side">
+    <div id="controls">
+      <div class="r r4">
+        <button type="button" data-step="-10">◀◀</button>
+        <button type="button" data-step="-1" data-hold>◀</button>
+        <button type="button" data-step="1" data-hold>▶</button>
+        <button type="button" data-step="10">▶▶</button>
+      </div>
+      <div class="r r2">
+        <button id="next" class="primary" type="button">Next</button>
+        <button id="unsc" class="bad" type="button">Unscorable</button>
+      </div>
+      <div class="r r4">
+        <button class="ic" type="button" data-mark="icL">IC L</button>
+        <button class="ic" type="button" data-mark="icR">IC R</button>
+        <button class="to" type="button" data-mark="toL">TO L</button>
+        <button class="to" type="button" data-mark="toR">TO R</button>
+      </div>
+      <div class="r r4">
+        <button id="turn" class="turn" type="button">Turn</button>
+        <button id="low" type="button">Low</button>
+        <button id="undo" type="button">Undo</button>
+        <button id="del" type="button">Delete</button>
+      </div>
+    </div>
+    <div id="list"></div>
+  </div>
+</div>
+
+<div id="menu">
+  <div class="sheet">
+    <div id="menuInfo" class="dim" style="font-size:13px;word-break:break-all"></div>
+    <button id="export" class="primary" type="button">Export CSV</button>
+    <button id="goto" type="button">Go to frame…</button>
+    <button id="fit" type="button">Fit picture</button>
+    <button id="close" type="button">Close this pack</button>
+    <button id="menuCancel" type="button">Cancel</button>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+
+/* ---------- state, and the names the copied functions use ---------- */
+
+const S = {
+  pack: null, rows: [], i: 0, marks: [], deletions: [], dirty: false,
+  zip: null, file: null, zoom: 1, panX: 0, panY: 0,
+};
+
+// The copied functions name keys through CFG.keys and keyName(). Here those are
+// buttons, so the messages name the button to press.
+const CFG = { keys: { undo: "Undo", sync: "—", icL: "IC L", icR: "IC R", toL: "TO L", toR: "TO R" } };
+const keyName = k => k;
+const footKeys = () => "IC L / IC R / TO L / TO R";
+
+const EVENTS = {
+  icL: { event: "IC", foot: "L" },
+  toL: { event: "TO", foot: "L" },
+  icR: { event: "IC", foot: "R" },
+  toR: { event: "TO", foot: "R" },
+  unscorable: { event: "UNSCORABLE", foot: "" },
+};
+const SYNC = "SYNC_FLASH";
+const GAIT_EVENTS = ["IC", "TO"];
+const LANDMARKS = ["START_PRESS", "WALK_START", "WALK_END", "STOP_PRESS"];
+const TURN_SPAN = ["TURN_START", "TURN_END"];
+const OTHER_FOOT = { L: "R", R: "L" };
+const PIXELATE_ABOVE = 1.8;
+const MAX_ZOOM = 8;
+// Frames per pixel of a one-finger drag at fit zoom. Drag left to go forward.
+const JOG_PX = 10;
+
+const $ = id => document.getElementById(id);
+const pad6 = n => String(n).padStart(6, "0");
+
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.classList.add("on");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("on"), 1600);
+}
+
+let seq = 0;
+
+/* ---- copied from annotate.html: keep identical (selftest.py checks) ---- */
+function syncIndex(m) {
+  const k = /(?:^|;)\s*sync_index=(\d+)\s*(?:;|$)/.exec((m && m.note) || "");
+  return k ? Number(k[1]) : null;
+}
+
+function followsInCycle(m) {
+  return m.event === "IC"
+    ? { event: "TO", foot: OTHER_FOOT[m.foot] || "" }
+    : { event: "IC", foot: m.foot };
+}
+
+function standsFor(m) {
+  if (!m || m.event !== "UNSCORABLE") return null;
+  const k = /(?:^|;)\s*stands_for=(IC|TO)-([LR])\s*(?:;|$)/.exec(m.note || "");
+  return k ? { event: k[1], foot: k[2] } : null;
+}
+
+function cycleEvent(m) {
+  return GAIT_EVENTS.includes(m.event) ? m : standsFor(m);
+}
+
+function nextInCycle() {
+  const here = S.rows[S.i].frame_index;
+  // The most recent IC or TO, or UNSCORABLE standing for one, at or before the
+  // current frame. Ties are broken by insertion order, so a TO marked after an
+  // IC on the same frame wins.
+  let last = null;
+  for (const m of S.marks) {
+    if (m.frame_index > here) break;                       // S.marks is frame-sorted
+    if (!cycleEvent(m)) continue;
+    if (!last || m.frame_index > last.frame_index ||
+        (m.frame_index === last.frame_index && (m._seq || 0) > (last._seq || 0))) last = m;
+  }
+  if (!last) return null;
+  return followsInCycle(cycleEvent(last));
+}
+
+const describe = m => {
+  if (m.event === SYNC) return `SYNC ${syncIndex(m) ?? "?"}`;
+  const sf = standsFor(m);
+  return `${m.event}${m.foot ? "-" + m.foot : ""}${sf ? `(${sf.event}-${sf.foot})` : ""}`;
+};
+
+function addMark(spec) {
+  const row = S.rows[S.i];
+  let displaced = [];
+  let note = spec.note || "";
+  if (LANDMARKS.includes(spec.event)) {
+    const at = S.marks.findIndex(m => m.event === spec.event);
+    if (at >= 0) {
+      const was = S.marks[at].frame_index;
+      if (was === row.frame_index) { toast(`${spec.event} already here`); return; }
+      S.marks.splice(at, 1);
+      toast(`moved ${spec.event}: ${was} -> ${row.frame_index}`);
+    }
+  } else if (GAIT_EVENTS.includes(spec.event)) {
+    // ONE GAIT EVENT PER FRAME: a new one REPLACES whatever was there.
+    //
+    // A frame is one instant of one participant, so it cannot be an initial
+    // contact and a toe-off at once, and it cannot belong to both feet. The
+    // previous behaviour let them pile up: pressing `e` where `w` was meant
+    // left IC-R and TO-L on the same frame, both exported, and no report reads
+    // that as a mistake -- `validity.py` would match one of them to a detected
+    // event and count the other as a false positive by the rater.
+    //
+    // Correcting a mis-keyed mark is therefore just marking the right one, with
+    // no undo-then-remark step to remember. What is displaced rides along on the
+    // new mark so `u` puts it back; losing a correct mark to a mistyped key,
+    // unrecoverably, is the failure this must not have.
+    //
+    // UNSCORABLE is deliberately not in this set. It records that a step was
+    // looked at and could not be judged, which is a different statement from
+    // "the event is here" and is counted separately in every report.
+    if (S.marks.some(m => m.frame_index === row.frame_index &&
+                          m.event === spec.event && m.foot === spec.foot)) {
+      toast("already marked here"); return;
+    }
+    displaced = S.marks.filter(m => m.frame_index === row.frame_index &&
+                                    GAIT_EVENTS.includes(m.event));
+    if (displaced.length) {
+      S.marks = S.marks.filter(m => !displaced.includes(m));
+    }
+  } else if (spec.event === "UNSCORABLE") {
+    // See AN UNSCORABLE TAKES ITS EVENT'S PLACE IN THE CYCLE. One per frame, like
+    // a gait event. On a frame that already holds an IC or TO, the UNSCORABLE
+    // takes that event's place and displaces it (`u` puts it back). Otherwise it
+    // stands for whatever `space` would have marked here.
+    if (S.marks.some(m => m.frame_index === row.frame_index && m.event === "UNSCORABLE")) {
+      toast("already unscorable here"); return;
+    }
+    displaced = S.marks.filter(m => m.frame_index === row.frame_index &&
+                                    GAIT_EVENTS.includes(m.event));
+    const sf = displaced.length ? displaced[0] : nextInCycle();
+    if (displaced.length) S.marks = S.marks.filter(m => !displaced.includes(m));
+    if (sf) note = `stands_for=${sf.event}-${sf.foot}`;
+    else toast(`UNSCORABLE with no cycle to follow: press ${footKeys()} on the next event you can see`);
+  } else if (S.marks.some(m => m.frame_index === row.frame_index &&
+                               m.event === spec.event && m.foot === spec.foot)) {
+    toast("already marked here"); return;
+  }
+  // _seq records insertion order. The array is kept sorted by frame so the
+  // timeline and log read correctly, which means "the last element" is not
+  // "the mark just added" — undo and the low-confidence flag both need _seq.
+  S.marks.push({
+    frame_index: row.frame_index, t_s: row.t_s,
+    event: spec.event, foot: spec.foot, confidence: "high", note,
+    _seq: ++seq, _replaced: displaced.length ? displaced : undefined,
+  });
+  S.marks.sort((a, b) => a.frame_index - b.frame_index ||
+                         a.event.localeCompare(b.event) || a.foot.localeCompare(b.foot));
+  S.dirty = true;
+  const made = S.marks.find(m => m._seq === seq);
+  if (spec.event === SYNC)
+    toast(`${describe(made)} @ ${row.frame_index} — not the number on screen? ` +
+          `${keyName(CFG.keys.sync)} again to change it`);
+  else if (spec.event !== "UNSCORABLE" || note) toast(displaced.length
+    ? `${describe(made)} @ ${row.frame_index} — replaced ` +
+      `${displaced.map(describe).join(", ")} (${keyName(CFG.keys.undo)} puts it back)`
+    : `${describe(made)} @ ${row.frame_index}`);
+  renderLog(); drawMarks(); updateCounts();
+}
+
+function undo() {
+  // Whichever happened last — a mark being added or a frame being cleared —
+  // is what `u` reverses. Both draw _seq from one counter, so that is a
+  // comparison rather than a guess.
+  const at = newestIndex();
+  const markSeq = at >= 0 ? (S.marks[at]._seq || 0) : -1;
+  const del = S.deletions[S.deletions.length - 1];
+  if (del && del._seq > markSeq) {
+    S.deletions.pop();
+    S.marks.push(...del.marks);
+    S.marks.sort((a, b) => a.frame_index - b.frame_index ||
+                           a.event.localeCompare(b.event) || a.foot.localeCompare(b.foot));
+    S.dirty = true;
+    toast(`restored ${del.marks.map(describe).join(", ")} @ ${del.frame_index}`);
+    renderLog(); drawMarks(); updateCounts();
+    return;
+  }
+  if (at < 0) { toast("nothing to undo"); return; }
+  // Undo removes the last-ADDED mark, not the last by frame number.
+  const m = S.marks.splice(at, 1)[0];
+  // and restores whatever that mark displaced, so a mistyped key costs nothing.
+  if (m._replaced && m._replaced.length) {
+    S.marks.push(...m._replaced);
+    S.marks.sort((a, b) => a.frame_index - b.frame_index ||
+                           a.event.localeCompare(b.event) || a.foot.localeCompare(b.foot));
+  }
+  S.dirty = true;
+  toast(m._replaced && m._replaced.length
+    ? `undid ${describe(m)} @ ${m.frame_index} — ${m._replaced.map(describe).join(", ")} is back`
+    : `undid ${describe(m)} @ ${m.frame_index}`);
+  renderLog(); drawMarks(); updateCounts();
+}
+
+function deleteFrame() {
+  // Delete / Backspace: every mark on the frame on screen, whatever kind —
+  // gait events, landmarks, stamps, turn marks. It is the frame-sized eraser,
+  // and it is undoable, which is why it needs no confirm: `u` puts all of them
+  // back in one step, exactly as they were.
+  const here = S.rows[S.i].frame_index;
+  const gone = S.marks.filter(m => m.frame_index === here);
+  if (!gone.length) { toast(`nothing marked on frame ${here}`); return; }
+  S.marks = S.marks.filter(m => m.frame_index !== here);
+  S.deletions.push({ _seq: ++seq, frame_index: here, marks: gone });
+  S.dirty = true;
+  toast(`deleted ${gone.map(describe).join(", ")} @ ${here} (${keyName(CFG.keys.undo)} puts it back)`);
+  renderLog(); drawMarks(); updateCounts();
+}
+
+function newestIndex() {
+  let best = -1, at = -1;
+  S.marks.forEach((m, k) => { if ((m._seq || 0) > best) { best = m._seq || 0; at = k; } });
+  return at;
+}
+
+function flagLow() {
+  const newest = newestIndex();
+  if (newest < 0) { toast("no mark to flag"); return; }
+  S.marks[newest].confidence = S.marks[newest].confidence === "low" ? "high" : "low";
+  S.dirty = true;
+  toast(`${S.marks[newest].event} @ ${S.marks[newest].frame_index} → ${S.marks[newest].confidence}`);
+  renderLog();
+}
+
+function turnsOpen() {
+  // Whether the turn span at or before the current frame is still open, so `z`
+  // knows which end it is marking. Counted along the timeline rather than kept
+  // as a flag, so it stays right when the rater jumps about or resumes a CSV.
+  const here = S.rows[S.i].frame_index;
+  let open = false;
+  for (const m of S.marks) {
+    if (m.frame_index > here) break;
+    if (m.event === "TURN_START") open = true;
+    else if (m.event === "TURN_END") open = false;
+  }
+  return open;
+}
+
+function markTurn() {
+  const spec = { event: turnsOpen() ? "TURN_END" : "TURN_START", foot: "" };
+  const here = S.rows[S.i].frame_index;
+  if (S.marks.some(m => m.frame_index === here && TURN_SPAN.includes(m.event))) {
+    toast("a turn mark is already on this frame"); return;
+  }
+  addMark(spec);
+}
+/* ---- end of the copies ---- */
+
+/* ---------- the pack: a stored zip, read in slices ---------- */
+/*
+  phone_pack.py writes the zip with no compression, so every entry is its bytes
+  at an offset and nothing has to be inflated. The central directory is read
+  once. Each frame is a slice of the File, which iOS reads from Files on demand,
+  so a pack of several hundred MB never sits in memory.
+*/
+async function readZip(file) {
+  const tailLen = Math.min(file.size, 65557);
+  const tail = new DataView(await file.slice(file.size - tailLen).arrayBuffer());
+  let eocd = -1;
+  for (let p = tailLen - 22; p >= 0; p--) if (tail.getUint32(p, true) === 0x06054b50) { eocd = p; break; }
+  if (eocd < 0) throw new Error("This is not a zip file.");
+  const n = tail.getUint16(eocd + 10, true);
+  const cdSize = tail.getUint32(eocd + 12, true), cdOff = tail.getUint32(eocd + 16, true);
+  const cd = new DataView(await file.slice(cdOff, cdOff + cdSize).arrayBuffer());
+  const dec = new TextDecoder();
+  const entries = new Map();
+  let p = 0;
+  for (let k = 0; k < n; k++) {
+    if (cd.getUint32(p, true) !== 0x02014b50) throw new Error("The zip's directory is damaged.");
+    const method = cd.getUint16(p + 10, true), size = cd.getUint32(p + 20, true);
+    const nameLen = cd.getUint16(p + 28, true), extraLen = cd.getUint16(p + 30, true);
+    const commentLen = cd.getUint16(p + 32, true), local = cd.getUint32(p + 42, true);
+    const name = dec.decode(new Uint8Array(cd.buffer, p + 46, nameLen));
+    if (method !== 0) throw new Error(`${name} is compressed. Make the pack with phone_pack.py.`);
+    entries.set(name, { local, size, data: null });
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  // The data starts after the entry's own local header, whose name and extra
+  // field lengths can differ from the directory's, so it is read once per entry.
+  async function blob(name, type) {
+    const e = entries.get(name);
+    if (!e) return null;
+    if (e.data === null) {
+      const h = new DataView(await file.slice(e.local, e.local + 30).arrayBuffer());
+      if (h.getUint32(0, true) !== 0x04034b50) throw new Error(`${name}: damaged entry`);
+      e.data = e.local + 30 + h.getUint16(26, true) + h.getUint16(28, true);
+    }
+    return file.slice(e.data, e.data + e.size, type);
+  }
+  return { entries, blob };
+}
+
+async function openPack(file) {
+  $("openErr").textContent = "Reading the pack…";
+  const zip = await readZip(file);
+  const pj = await zip.blob("pack.json", "application/json");
+  if (!pj) throw new Error("No pack.json in this zip. Make the pack with phone_pack.py.");
+  const pack = JSON.parse(await pj.text());
+  if (pack.schemaVersion !== 1) throw new Error(`Pack schema ${pack.schemaVersion} is not one this page reads.`);
+  const missing = pack.rows.filter(([fi]) => !zip.entries.has(`frames/f_${pad6(fi)}.jpg`));
+  if (missing.length)
+    throw new Error(`${missing.length} of the pack's ${pack.rows.length} frames have no image ` +
+                    `(first: ${missing[0][0]}). The pack is incomplete; make it again.`);
+  S.zip = zip; S.file = file;
+  await startPack(pack);
+  $("openErr").textContent = "";
+}
+
+/* ---------- saved on the phone (IndexedDB) ---------- */
+
+function idb() {
+  return new Promise((ok, fail) => {
+    const r = indexedDB.open("gait-phone-marks", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("packs", { keyPath: "pack_id" });
+    r.onsuccess = () => ok(r.result); r.onerror = () => fail(r.error);
+  });
+}
+async function idbDo(mode, fn) {
+  const db = await idb();
+  return new Promise((ok, fail) => {
+    const tx = db.transaction("packs", mode), st = tx.objectStore("packs");
+    const req = fn(st);
+    tx.oncomplete = () => ok(req && req.result); tx.onerror = () => fail(tx.error);
+  });
+}
+const strip = m => { const o = { ...m }; if (o._replaced) o._replaced = o._replaced.map(strip); return o; };
+let saveTimer = null;
+function persist() {
+  if (!S.pack) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    const rec = { pack_id: S.pack.pack_id, pack: S.pack, marks: S.marks.map(strip),
+                  deletions: S.deletions, seq, i: S.i, saved: new Date().toISOString(),
+                  exported: S.exported || null };
+    idbDo("readwrite", st => st.put(rec)).catch(e => toast(`NOT saved on the phone: ${e.message}`));
+  }, 150);
+}
+
+async function startPack(pack) {
+  const saved = await idbDo("readonly", st => st.get(pack.pack_id)).catch(() => null);
+  S.pack = pack;
+  S.rows = pack.rows.map(([frame_index, t_s]) => ({ frame_index, t_s }));
+  if (saved) {
+    S.marks = saved.marks; S.deletions = saved.deletions || []; seq = saved.seq || 0;
+    S.i = Math.min(saved.i || 0, S.rows.length - 1); S.exported = saved.exported;
+    toast(`resumed ${S.marks.filter(m => !m._context).length} marks`);
+  } else {
+    // The pack's marks carry _seq 0, so Undo never reaches them, and _fromPack,
+    // so the export can tell them from marks made here.
+    const ctx = (pack.context || []).map(m => ({ ...m, _seq: 0, _context: true }));
+    const own = (pack.marks_in_range || []).map(m => ({ ...m, _seq: 0, _fromPack: true }));
+    S.marks = [...ctx, ...own].sort((a, b) => a.frame_index - b.frame_index ||
+      a.event.localeCompare(b.event) || a.foot.localeCompare(b.foot));
+    S.deletions = []; seq = 0; S.i = 0; S.exported = null;
+  }
+  $("open").style.display = "none";
+  $("app").classList.add("on");
+  S.zoom = 1; S.panX = 0; S.panY = 0;
+  sizeStrip();
+  goTo(S.i);
+  renderLog();
+  updateCounts();
+}
+
+/* ---------- showing a frame ---------- */
+
+const urls = new Map();
+async function urlFor(pos) {
+  if (urls.has(pos)) return urls.get(pos);
+  const b = await S.zip.blob(`frames/f_${pad6(S.rows[pos].frame_index)}.jpg`, "image/jpeg");
+  const u = URL.createObjectURL(b);
+  urls.set(pos, u);
+  // Bounded, as in annotate.html: keep what is near the frame on screen.
+  if (urls.size > 160)
+    for (const [k, v] of urls) if (Math.abs(k - S.i) > 80) { URL.revokeObjectURL(v); urls.delete(k); }
+  return u;
+}
+
+let showing = -1;
+async function goTo(pos) {
+  if (!S.rows.length) return;
+  S.i = Math.max(0, Math.min(S.rows.length - 1, pos));
+  const row = S.rows[S.i];
+  $("fi").textContent = row.frame_index;
+  $("ts").textContent = `${row.t_s.toFixed(3)} s`;
+  updateHere();
+  drawMarks();
+  highlightLog();
+  persist();
+  if (!S.zip) return;                         // a saved pack opened without its zip
+  const want = S.i;
+  const img = $("frame");
+  // A frame still loading is not shown at all, rather than the previous one
+  // under the new frame number.
+  if (showing !== want) img.classList.add(scrubbing ? "stale" : "pending");
+  const u = await urlFor(want);
+  if (S.i !== want) return;
+  img.onload = () => {
+    if (S.i === want) { showing = want; img.classList.remove("pending", "stale"); applyView(); }
+  };
+  img.src = u;
+  for (let k = 1; k <= 6; k++) if (want + k < S.rows.length) urlFor(want + k).then(v => { new Image().src = v; });
+}
+
+function updateHere() {
+  const nx = nextInCycle(), here = S.rows[S.i].frame_index;
+  const on = S.marks.filter(m => m.frame_index === here && !m._context);
+  $("here").textContent = on.length ? on.map(describe).join(", ") : "";
+  $("here").style.display = on.length ? "" : "none";
+  $("next").textContent = nx ? `Next · ${nx.event}-${nx.foot}` : "Next · set a foot";
+  $("next").classList.toggle("off", !nx);
+  $("turn").textContent = turnsOpen() ? "Turn end" : "Turn start";
+}
+
+/* ---------- the copied functions' hooks ---------- */
+
+function renderLog() {
+  const box = $("list");
+  const own = S.marks.filter(m => !m._context);
+  box.innerHTML = own.map(m =>
+    `<div data-f="${m.frame_index}" class="t${m.event}"><span>${m.frame_index}</span>` +
+    `<span>${describe(m)}${m.confidence === "low" ? " · low" : ""}</span>` +
+    `<span class="dim">${m.t_s.toFixed(3)}</span></div>`).join("") ||
+    `<div class="dim" style="display:block">No marks yet. Set the first foot with IC L / IC R / TO L / TO R, then Next.</div>`;
+  highlightLog();
+  persist();
+}
+function highlightLog() {
+  const here = S.rows.length ? S.rows[S.i].frame_index : null;
+  let first = null;
+  for (const el of $("list").children) {
+    const on = Number(el.dataset.f) === here;
+    el.classList.toggle("on", on);
+    if (on && !first) first = el;
+  }
+  if (first) first.scrollIntoView({ block: "nearest" });
+}
+function updateCounts() {
+  const own = S.marks.filter(m => !m._context);
+  const n = e => own.filter(m => m.event === e).length;
+  $("counts").textContent = `IC ${n("IC")} · TO ${n("TO")} · ✕ ${n("UNSCORABLE")} · turns ${n("TURN_START")}`;
+  updateHere();
+}
+
+/* The strip under the picture: the whole range, every mark, and where you are.
+   Touch it to scrub. */
+function sizeStrip() {
+  const c = $("strip"), r = window.devicePixelRatio || 1;
+  c.width = Math.round(c.clientWidth * r); c.height = Math.round(c.clientHeight * r);
+  drawMarks();
+}
+function drawMarks() {
+  const c = $("strip"), g = c.getContext("2d");
+  if (!S.rows.length || !c.width) return;
+  const W = c.width, H = c.height, n = S.rows.length;
+  const first = S.rows[0].frame_index, last = S.rows[n - 1].frame_index;
+  const x = fi => (fi - first + 0.5) / (last - first + 1) * W;
+  g.clearRect(0, 0, W, H);
+  // Turn spans, including one opened before the range or left open after it.
+  let from = null;
+  g.fillStyle = "rgba(77,182,172,.28)";
+  for (const m of S.marks) {
+    if (m.event === "TURN_START") from = m.frame_index;
+    else if (m.event === "TURN_END" && from !== null) {
+      g.fillRect(x(Math.max(from, first)), 0, x(m.frame_index) - x(Math.max(from, first)), H); from = null;
+    }
+  }
+  if (from !== null) g.fillRect(x(Math.max(from, first)), 0, W - x(Math.max(from, first)), H);
+  const col = { IC: "#4fc3f7", TO: "#ffb74d", UNSCORABLE: "#ef5350", TURN_START: "#4db6ac", TURN_END: "#4db6ac" };
+  for (const m of S.marks) {
+    if (m._context || m.frame_index < first || m.frame_index > last) continue;
+    g.fillStyle = col[m.event] || "#999";
+    const top = m.event === "IC" ? 0 : m.event === "TO" ? H * 0.45 : H * 0.25;
+    g.fillRect(Math.round(x(m.frame_index)) - 1, top, 3, H * 0.55);
+  }
+  g.fillStyle = "#fff";
+  g.fillRect(Math.round(x(S.rows[S.i].frame_index)) - 1, 0, 2, H);
+}
+
+/* ---------- zoom, pan and jog on the picture ---------- */
+
+function applyView() {
+  const img = $("frame"), stage = $("stage");
+  const maxX = Math.max(0, (img.clientWidth * S.zoom - stage.clientWidth) / 2);
+  const maxY = Math.max(0, (img.clientHeight * S.zoom - stage.clientHeight) / 2);
+  S.panX = Math.max(-maxX, Math.min(maxX, S.panX));
+  S.panY = Math.max(-maxY, Math.min(maxY, S.panY));
+  img.style.transform = `translate(${S.panX}px, ${S.panY}px) scale(${S.zoom})`;
+  img.classList.toggle("pixels", S.zoom > PIXELATE_ABOVE);
+  $("zoomTag").textContent = S.zoom > 1.01 ? `${S.zoom.toFixed(1)}x` : "";
+}
+
+const ptrs = new Map();
+let gesture = null, lastTap = 0;
+$("stage").addEventListener("pointerdown", ev => {
+  $("stage").setPointerCapture(ev.pointerId);
+  ptrs.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+  startGesture();
+  if (ptrs.size === 1) {
+    const now = Date.now();
+    if (now - lastTap < 300) {               // double tap: fit, or 3x where tapped
+      const r = $("stage").getBoundingClientRect();
+      if (S.zoom > 1.01) { S.zoom = 1; S.panX = 0; S.panY = 0; }
+      else { S.zoom = 3; S.panX = -(ev.clientX - r.left - r.width / 2) * 2; S.panY = -(ev.clientY - r.top - r.height / 2) * 2; }
+      applyView(); gesture = null; lastTap = 0; return;
+    }
+    lastTap = now;
+  }
+});
+function startGesture() {
+  const p = [...ptrs.values()];
+  if (p.length === 1) gesture = { kind: S.zoom > 1.01 ? "pan" : "jog", x: p[0].x, y: p[0].y,
+                                  panX: S.panX, panY: S.panY, i: S.i };
+  else if (p.length === 2) gesture = { kind: "pinch", d: Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y),
+                                       mx: (p[0].x + p[1].x) / 2, my: (p[0].y + p[1].y) / 2,
+                                       zoom: S.zoom, panX: S.panX, panY: S.panY };
+}
+$("stage").addEventListener("pointermove", ev => {
+  if (!ptrs.has(ev.pointerId) || !gesture) return;
+  ptrs.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+  const p = [...ptrs.values()];
+  if (gesture.kind === "jog" && p.length === 1) {
+    const k = gesture.i - Math.round((p[0].x - gesture.x) / JOG_PX);
+    if (k !== S.i) goTo(k);
+  } else if (gesture.kind === "pan" && p.length === 1) {
+    S.panX = gesture.panX + (p[0].x - gesture.x); S.panY = gesture.panY + (p[0].y - gesture.y); applyView();
+  } else if (gesture.kind === "pinch" && p.length === 2) {
+    const d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+    const z = Math.max(1, Math.min(MAX_ZOOM, gesture.zoom * d / gesture.d));
+    const mx = (p[0].x + p[1].x) / 2, my = (p[0].y + p[1].y) / 2;
+    S.panX = gesture.panX * z / gesture.zoom + (mx - gesture.mx);
+    S.panY = gesture.panY * z / gesture.zoom + (my - gesture.my);
+    S.zoom = z;
+    if (z <= 1.01) { S.panX = 0; S.panY = 0; }
+    applyView();
+  }
+});
+for (const e of ["pointerup", "pointercancel"]) {
+  $("stage").addEventListener(e, ev => { ptrs.delete(ev.pointerId); startGesture(); });
+}
+
+// The strip under the picture is the whole range: tap a point to jump to that
+// frame, or hold and slide to run through the frames fast. Asked for 12 Oct 2026.
+let scrubbing = false;
+function scrub(ev) {
+  const r = $("strip").getBoundingClientRect();
+  const k = Math.floor((ev.clientX - r.left) / r.width * S.rows.length);
+  if (Math.max(0, Math.min(S.rows.length - 1, k)) !== S.i) goTo(k);
+}
+$("strip").addEventListener("pointerdown", ev => {
+  $("strip").setPointerCapture(ev.pointerId);
+  scrubbing = true;
+  scrub(ev);
+});
+$("strip").addEventListener("pointermove", ev => { if (scrubbing) scrub(ev); });
+for (const e of ["pointerup", "pointercancel"]) {
+  $("strip").addEventListener(e, () => {
+    if (!scrubbing) return;
+    scrubbing = false;
+    // The finger is off: from here a frame not yet loaded is hidden, not dimmed.
+    if (showing !== S.i) goTo(S.i);
+  });
+}
+
+/* ---------- the buttons ---------- */
+
+for (const b of document.querySelectorAll("[data-step]")) {
+  const step = Number(b.dataset.step);
+  let hold = null, rep = null;
+  const stop = () => { clearTimeout(hold); clearInterval(rep); hold = rep = null; };
+  b.addEventListener("pointerdown", () => {
+    goTo(S.i + step);
+    if (b.hasAttribute("data-hold")) hold = setTimeout(() => { rep = setInterval(() => goTo(S.i + step), 70); }, 380);
+  });
+  for (const e of ["pointerup", "pointercancel", "pointerleave"]) b.addEventListener(e, stop);
+}
+for (const b of document.querySelectorAll("[data-mark]")) {
+  b.addEventListener("click", () => addMark(EVENTS[b.dataset.mark]));
+}
+$("next").addEventListener("click", () => {
+  const nx = nextInCycle();
+  if (!nx) { toast(`Nothing to follow yet: press ${footKeys()} on the first event you can see`); return; }
+  addMark(nx);
+});
+$("unsc").addEventListener("click", () => addMark(EVENTS.unscorable));
+$("turn").addEventListener("click", markTurn);
+$("del").addEventListener("click", deleteFrame);
+// Undo and Low act on the newest mark MADE HERE. The pack's own marks and the
+// context carry _seq 0, and newestIndex() would otherwise return one of them.
+function newestMadeHere() {
+  const at = newestIndex();
+  return at >= 0 && (S.marks[at]._seq || 0) > 0 ? at : -1;
+}
+$("undo").addEventListener("click", () => {
+  const del = S.deletions[S.deletions.length - 1];
+  if (newestMadeHere() < 0 && !del) { toast("nothing to undo"); return; }
+  undo();
+});
+$("low").addEventListener("click", () => {
+  if (newestMadeHere() < 0) { toast("no mark made here to flag"); return; }
+  flagLow();
+});
+$("list").addEventListener("click", ev => {
+  const row = ev.target.closest("[data-f]");
+  if (row) goTo(S.rows.findIndex(r => r.frame_index === Number(row.dataset.f)));
+});
+
+// A keyboard (iPad, or testing on the Mac): annotate.html's default keys.
+window.addEventListener("keydown", ev => {
+  if (!S.pack || ev.metaKey || ev.ctrlKey) return;
+  const k = ev.key;
+  const map = { q: "icL", w: "toL", e: "icR", r: "toR" };
+  if (map[k]) addMark(EVENTS[map[k]]);
+  else if (k === " ") $("next").click();
+  else if (k === "x") addMark(EVENTS.unscorable);
+  else if (k === "z") markTurn();
+  else if (k === "u") $("undo").click();
+  else if (k === "Delete" || k === "Backspace") deleteFrame();
+  else if (k === "ArrowRight" || k === "]") goTo(S.i + (ev.shiftKey ? 10 : 1));
+  else if (k === "ArrowLeft" || k === "[") goTo(S.i - (ev.shiftKey ? 10 : 1));
+  else return;
+  ev.preventDefault();
+});
+
+/* ---------- the menu, and export ---------- */
+
+$("menuBtn").addEventListener("click", () => {
+  const p = S.pack;
+  $("menuInfo").textContent = `${p.pack_id} · ${p.rater} · frames ${p.range[0]}–${p.range[1]}` +
+    (S.exported ? ` · last exported ${S.exported.slice(0, 16).replace("T", " ")}` : " · not exported yet");
+  $("menu").classList.add("on");
+});
+$("menuCancel").addEventListener("click", () => $("menu").classList.remove("on"));
+$("menu").addEventListener("click", ev => { if (ev.target.id === "menu") $("menu").classList.remove("on"); });
+$("fit").addEventListener("click", () => { S.zoom = 1; S.panX = S.panY = 0; applyView(); $("menu").classList.remove("on"); });
+$("goto").addEventListener("click", () => {
+  $("menu").classList.remove("on");
+  const v = prompt(`Frame index (${S.rows[0].frame_index}–${S.rows[S.rows.length - 1].frame_index})`);
+  if (v === null) return;
+  const k = S.rows.findIndex(r => r.frame_index === Number(v));
+  if (k < 0) toast(`${v} is not a frame of this pack`); else goTo(k);
+});
+$("close").addEventListener("click", () => { $("menu").classList.remove("on"); closePack(); });
+$("export").addEventListener("click", () => { $("menu").classList.remove("on"); exportCsv(); });
+
+// The same checks annotate.html makes before saving, for the marks a phone can
+// make: no gait event inside a turn, and the cycle order along each straight.
+function problems() {
+  const own = S.marks.filter(m => !m._context);
+  const out = [];
+  const spans = [];
+  let from = null;
+  for (const m of S.marks) {
+    if (m.event === "TURN_START") from = m.frame_index;
+    else if (m.event === "TURN_END" && from !== null) { spans.push([from, m.frame_index]); from = null; }
+  }
+  for (const [a, b] of spans) {
+    const inside = own.filter(m => GAIT_EVENTS.includes(m.event) && m.frame_index > a && m.frame_index < b);
+    if (inside.length) out.push(`the turn ${a}–${b} contains ${inside.length} gait event(s)`);
+  }
+  const breaks = [];
+  let prev = null;
+  for (const m of S.marks) {
+    if (m.event === "TURN_START" || m.event === "TURN_END" ||
+        (m.event === "UNSCORABLE" && !standsFor(m))) { prev = null; continue; }
+    const c = cycleEvent(m);
+    if (!c) continue;
+    if (prev) {
+      const want = followsInCycle(cycleEvent(prev));
+      if (want.event !== c.event || want.foot !== c.foot)
+        breaks.push(`${describe(prev)} @ ${prev.frame_index} then ${describe(m)} @ ${m.frame_index}`);
+    }
+    prev = m;
+  }
+  if (breaks.length) out.push(`${breaks.length} break(s) in the gait cycle:\n  ` + breaks.slice(0, 4).join("\n  "));
+  if (from !== null) out.push(`a turn is still open at the end of the portion (fine if it carries on past it)`);
+  return out;
+}
+
+function toCsv() {
+  const p = S.pack, b = p.bout;
+  const head = [
+    `# gait event annotation`,
+    `# rater,${p.rater}`,
+    `# bout_id,${b.bout_id}`,
+    `# name_initial,${b.name_initial}`,
+    `# condition,${b.condition}`,
+    `# trial,${b.trial}`,
+    `# date,${b.date}`,
+    `# probe_file,${p.probe_file}`,
+    `# source_video,${p.source_video}`,
+    `# nominal_fps,${p.nominal_fps}`,
+    `# implied_fps,${p.implied_fps}`,
+    `# frames_from,${p.frames_from}`,
+    `# phone_pack,${p.pack_id}`,
+    `# range,${p.range[0]},${p.range[1]}`,
+    `# range_hash,${p.range_hash}`,
+    `# probe_sha256,${p.probe_sha256}`,
+    `# exported,${new Date().toISOString()}`,
+    `frame_index,t_s,event,foot,confidence,note`,
+  ];
+  // A mark made here says so in its note, which survives every later save on the
+  // Mac, so a reliability analysis can tell phone marks from Mac marks.
+  const body = S.marks.filter(m => !m._context).map(m => {
+    const note = m._fromPack ? (m.note || "") : [m.note, "src=phone"].filter(Boolean).join(";");
+    return [m.frame_index, m.t_s.toFixed(6), m.event, m.foot, m.confidence,
+            note.replace(/[",\n]/g, " ")].join(",");
+  });
+  return head.concat(body).join("\n") + "\n";
+}
+
+async function exportCsv() {
+  const pr = problems();
+  if (pr.length && !confirm("Before exporting:\n\n• " + pr.join("\n• ") + "\n\nExport anyway?")) return;
+  const name = `${S.pack.pack_id}-PhoneMarks.csv`;
+  const file = new File([toCsv()], name, { type: "text/csv" });
+  let done = false;
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file] }); done = true; }
+    catch (e) { if (e.name === "AbortError") { toast("export cancelled"); return; } }
+  }
+  if (!done) {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(file); a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  }
+  S.exported = new Date().toISOString(); persist();
+  toast(`exported ${name}`);
+}
+
+function closePack() {
+  persist();
+  for (const v of urls.values()) URL.revokeObjectURL(v);
+  urls.clear();
+  Object.assign(S, { pack: null, rows: [], marks: [], deletions: [], zip: null, file: null });
+  showing = -1;
+  $("frame").removeAttribute("src");
+  $("app").classList.remove("on");
+  $("open").style.display = "";
+  $("file").value = "";
+  listSaved();
+}
+
+/* ---------- the open screen ---------- */
+
+async function listSaved() {
+  const all = (await idbDo("readonly", st => st.getAll()).catch(() => [])) || [];
+  all.sort((a, b) => (b.saved || "").localeCompare(a.saved || ""));
+  $("savedList").innerHTML = all.length ? `<p class="dim">Saved on this phone</p>` + all.map(r => {
+    const n = r.marks.filter(m => !m._context).length;
+    return `<div class="saved" data-id="${r.pack_id}"><div class="who">${r.pack_id}</div>
+      <div class="dim" style="font-size:13px">${n} marks · saved ${(r.saved || "").slice(0, 16).replace("T", " ")}
+      · ${r.exported ? "exported " + r.exported.slice(0, 16).replace("T", " ") : "<b style='color:var(--to)'>not exported</b>"}</div>
+      <div class="row"><button type="button" data-act="export">Export CSV</button>
+      <button type="button" data-act="forget">Forget</button></div></div>`;
+  }).join("") : "";
+}
+$("savedList").addEventListener("click", async ev => {
+  const btn = ev.target.closest("button"), card = ev.target.closest(".saved");
+  if (!btn || !card) return;
+  const rec = await idbDo("readonly", st => st.get(card.dataset.id));
+  if (!rec) return listSaved();
+  if (btn.dataset.act === "forget") {
+    if (!confirm(`Forget the marks for ${rec.pack_id} on this phone?` +
+                 (rec.exported ? "" : "\n\nThey have NOT been exported, so they will be lost."))) return;
+    await idbDo("readwrite", st => st.delete(rec.pack_id));
+    return listSaved();
+  }
+  // Export without the zip: the rows and marks are all saved.
+  S.pack = rec.pack; S.rows = rec.pack.rows.map(([frame_index, t_s]) => ({ frame_index, t_s }));
+  S.marks = rec.marks; S.deletions = rec.deletions || []; seq = rec.seq || 0; S.i = rec.i || 0;
+  S.exported = rec.exported;
+  await exportCsv();
+  S.pack = null; S.rows = []; S.marks = [];
+  listSaved();
+});
+
+$("file").addEventListener("change", async () => {
+  const f = $("file").files[0];
+  if (!f) return;
+  try { await openPack(f); }
+  catch (e) { $("openErr").textContent = e.message; }
+});
+window.addEventListener("resize", () => { if (S.pack) { sizeStrip(); applyView(); } });
+document.addEventListener("visibilitychange", () => { if (document.hidden) persist(); });
+
+// Testing on the Mac only: ?pack=<url> opens a pack served from localhost.
+// Refused anywhere else, so the hosted page never fetches a pack.
+(async () => {
+  const q = new URLSearchParams(location.search).get("pack");
+  if (!q || !["localhost", "127.0.0.1"].includes(location.hostname)) return;
+  try {
+    const r = await fetch(q);
+    const b = await r.blob();
+    await openPack(new File([b], q.split("/").pop()));
+  } catch (e) { $("openErr").textContent = e.message; }
+})();
+
+listSaved();
+if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost"))
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+</script>
+</body>
+</html>
